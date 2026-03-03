@@ -2,6 +2,7 @@
 #include "loader/component_loader.hpp"
 
 #include "auth.hpp"
+#include "connection_log.hpp"
 #include "party.hpp"
 #include "command.hpp"
 #include "network.hpp"
@@ -115,7 +116,11 @@ namespace auth
 		void send_fragmented_connect_packet(const game::netsrc_t sock, game::netadr_t* adr, const char* data,
 		                                    const int length)
 		{
+			connection_log::log("send_fragmented_connect_packet: sock=%d addr=%u:%u data_len=%d",
+			                    static_cast<int>(sock), adr->addr, static_cast<unsigned>(adr->port), length);
+
 			const auto connect_data = serialize_connect_data(data, length);
+			int fragment_count = 0;
 			game::fragment_handler::fragment_data //
 			(connect_data.data(), connect_data.size(), [&](const utils::byte_buffer& buffer)
 			{
@@ -126,10 +131,13 @@ namespace auth
 
 				const auto& fragment_packet = packet_buffer.get_buffer();
 
+				++fragment_count;
 				game::NET_OutOfBandData(sock, adr,
 				                        fragment_packet.data(),
 				                        static_cast<int>(fragment_packet.size()));
 			});
+			connection_log::log("send_fragmented_connect_packet: sent %d fragments (total_size=%zu)",
+			                    fragment_count, connect_data.size());
 		}
 
 		int send_connect_data_stub(const game::netsrc_t sock, game::netadr_t* adr, const char* data, const int len)
@@ -139,14 +147,17 @@ namespace auth
 				const auto is_connect_sequence = len >= 7 && strncmp("connect", data, 7) == 0;
 				if (!is_connect_sequence)
 				{
+					connection_log::log("send_connect_data_stub: non-connect OOB data, len=%d", len);
 					return game::NET_OutOfBandData(sock, adr, data, len);
 				}
 
+				connection_log::log("send_connect_data_stub: intercepted connect sequence, len=%d", len);
 				send_fragmented_connect_packet(sock, adr, data, len);
 				return true;
 			}
 			catch (std::exception& e)
 			{
+				connection_log::log("send_connect_data_stub: EXCEPTION: %s", e.what());
 				printf("Error: %s\n", e.what());
 			}
 
@@ -228,6 +239,10 @@ namespace auth
 
 		void dispatch_connect_packet(const game::netadr_t& target, const std::string& data)
 		{
+			connection_log::log("dispatch_connect_packet: from %u:%u type=%d data_size=%zu",
+			                    target.addr, static_cast<unsigned>(target.port),
+			                    static_cast<int>(target.type), data.size());
+
 			utils::byte_buffer buffer(data);
 
 			utils::cryptography::ecc::key key{};
@@ -243,6 +258,7 @@ namespace auth
 			if (!utils::cryptography::ecc::verify_message(key, challenge, buffer.read_string()) && target.type !=
 				game::NA_LOOPBACK)
 			{
+				connection_log::log("dispatch_connect_packet: REJECTED - bad signature from %u:%u", target.addr, static_cast<unsigned>(target.port));
 				network::send(target, "error", "Bad signature");
 				return;
 			}
@@ -254,6 +270,7 @@ namespace auth
 
 			if (params.size() < 2)
 			{
+				connection_log::log("dispatch_connect_packet: REJECTED - insufficient params (size=%d)", params.size());
 				return;
 			}
 
@@ -263,6 +280,8 @@ namespace auth
 			const auto xuid = strtoull(info_string.get("xuid").data(), nullptr, 16);
 			if (xuid != key.get_hash())
 			{
+				connection_log::log("dispatch_connect_packet: REJECTED - bad XUID %llX vs key hash %llX",
+				                    xuid, key.get_hash());
 				network::send(target, "error", "Bad XUID");
 				return;
 			}
@@ -279,20 +298,30 @@ namespace auth
 
 			if (name.empty() || is_name_invalid())
 			{
+				connection_log::log("dispatch_connect_packet: REJECTED - bad name '%s'", name.data());
 				network::send(target, "error", "Bad name");
 				return;
 			}
 
+			connection_log::log("dispatch_connect_packet: ACCEPTED - name='%s' xuid=%llX, calling SV_DirectConnect",
+			                    name.data(), xuid);
+
 			profile_infos::add_and_distribute_profile_info(target, xuid, info);
 
 			game::SV_DirectConnect(target);
+			connection_log::log("dispatch_connect_packet: SV_DirectConnect returned, handling new player");
 			handle_new_player(target);
 		}
 
 		void handle_connect_packet_fragment(const game::netadr_t& target, const network::data_view& data)
 		{
+			connection_log::log("handle_connect_packet_fragment: from %u:%u data_size=%zu server_running=%d",
+			                    target.addr, static_cast<unsigned>(target.port), data.size(),
+			                    game::is_server_running());
+
 			if (!game::is_server_running())
 			{
+				connection_log::log("handle_connect_packet_fragment: IGNORED - server not running");
 				return;
 			}
 
@@ -301,10 +330,16 @@ namespace auth
 			std::string final_packet{};
 			if (game::fragment_handler::handle(target, buffer, final_packet))
 			{
+				connection_log::log("handle_connect_packet_fragment: all fragments received, dispatching (size=%zu)",
+				                    final_packet.size());
 				scheduler::once([t = target, p = std::move(final_packet)]
 				{
 					dispatch_connect_packet(t, p);
 				}, scheduler::server);
+			}
+			else
+			{
+				connection_log::log("handle_connect_packet_fragment: fragment buffered, waiting for more");
 			}
 		}
 

@@ -9,6 +9,8 @@
 #include "workshop.hpp"
 #include "profile_infos.hpp"
 
+#include "connection_log.hpp"
+
 #include <utils/hook.hpp>
 #include <utils/string.hpp>
 #include <utils/info_string.hpp>
@@ -40,12 +42,18 @@ namespace party
 		void connect_to_lobby(const game::netadr_t& addr, const std::string& mapname, const std::string& gamemode,
 		                      const std::string& usermap_id, const std::string& mod_id)
 		{
+			connection_log::log("connect_to_lobby: map=%s gametype=%s usermap=%s mod=%s addr=%u:%u",
+			                    mapname.data(), gamemode.data(), usermap_id.data(), mod_id.data(),
+			                    addr.addr, static_cast<unsigned>(addr.port));
+
 			auth::clear_stored_guids();
 
 			workshop::setup_same_mod_as_host(usermap_id, mod_id);
 
 			game::XSESSION_INFO info{};
+			connection_log::log("connect_to_lobby: calling CL_ConnectFromLobby");
 			game::CL_ConnectFromLobby(0, &info, &addr, 1, 0, mapname.data(), gamemode.data(), usermap_id.data());
+			connection_log::log("connect_to_lobby: CL_ConnectFromLobby returned");
 		}
 
 		void launch_mode(const game::eModes mode)
@@ -63,20 +71,29 @@ namespace party
 		                                const std::string& mod_id,
 		                                const bool was_retried = false)
 		{
+			connection_log::log("connect_to_lobby_with_mode: mode=%d mapname=%s gametype=%s was_retried=%d",
+			                    static_cast<int>(mode), mapname.data(), gametype.data(), was_retried);
+
 			if (game::Com_SessionMode_IsMode(mode))
 			{
+				connection_log::log("connect_to_lobby_with_mode: already in correct mode, connecting directly");
 				connect_to_lobby(addr, mapname, gametype, usermap_id, mod_id);
 				return;
 			}
 
 			if (!was_retried)
 			{
+				connection_log::log("connect_to_lobby_with_mode: wrong mode, launching mode %d and retrying in 5s", static_cast<int>(mode));
 				scheduler::once([=]
 				{
 					connect_to_lobby_with_mode(addr, mode, mapname, gametype, usermap_id, mod_id, true);
 				}, scheduler::main, 5s);
 
 				launch_mode(mode);
+			}
+			else
+			{
+				connection_log::log("connect_to_lobby_with_mode: FAILED - was_retried=true but still wrong mode");
 			}
 		}
 
@@ -98,14 +115,20 @@ namespace party
 		void connect_to_session(const game::netadr_t& addr, const std::string& hostname, const uint64_t xuid,
 		                        const game::eModes mode)
 		{
+			connection_log::log("connect_to_session: host=%s xuid=%llX mode=%d addr=%u:%u",
+			                    hostname.data(), xuid, static_cast<int>(mode),
+			                    addr.addr, static_cast<unsigned>(addr.port));
+
 			const auto LobbyJoin_Begin = reinterpret_cast<bool(*)(int actionId, game::ControllerIndex_t controllerIndex,
 			                                                      game::LobbyType sourceLobbyType,
 			                                                      game::LobbyType targetLobbyType)>(0x141ED94D0_g);
 
 			if (!LobbyJoin_Begin(0, game::CONTROLLER_INDEX_FIRST, game::LOBBY_TYPE_PRIVATE, game::LOBBY_TYPE_PRIVATE))
 			{
+				connection_log::log("connect_to_session: LobbyJoin_Begin FAILED");
 				return;
 			}
+			connection_log::log("connect_to_session: LobbyJoin_Begin succeeded");
 
 			auto& join = *game::s_join;
 
@@ -143,15 +166,22 @@ namespace party
 		void handle_connect_query_response(const bool success, const game::netadr_t& target,
 		                                   const utils::info_string& info, uint32_t ping)
 		{
+			connection_log::log("handle_connect_query_response: success=%d ping=%ums addr=%u:%u",
+			                    success, ping, target.addr, static_cast<unsigned>(target.port));
+
 			if (!success)
 			{
+				connection_log::log("handle_connect_query_response: query FAILED (timeout or no response)");
 				return;
 			}
 
 			is_connecting_to_dedi = info.get("dedicated") == "1";
+			connection_log::log("handle_connect_query_response: dedicated=%s", info.get("dedicated").data());
 
 			if (atoi(info.get("protocol").data()) != PROTOCOL)
 			{
+				connection_log::log("handle_connect_query_response: REJECTED - invalid protocol %s (expected %d)",
+				                    info.get("protocol").data(), PROTOCOL);
 				const auto str = "Invalid protocol.";
 				printf("%s\n", str);
 				return;
@@ -160,6 +190,8 @@ namespace party
 			const auto sub_protocol = atoi(info.get("sub_protocol").data());
 			if (sub_protocol != SUB_PROTOCOL && sub_protocol != (SUB_PROTOCOL - 1))
 			{
+				connection_log::log("handle_connect_query_response: REJECTED - invalid sub_protocol %d (expected %d)",
+				                    sub_protocol, SUB_PROTOCOL);
 				const auto str = "Invalid sub-protocol.";
 				printf("%s\n", str);
 				return;
@@ -168,6 +200,7 @@ namespace party
 			const auto gamename = info.get("gamename");
 			if (gamename != "T7"s)
 			{
+				connection_log::log("handle_connect_query_response: REJECTED - invalid gamename '%s'", gamename.data());
 				const auto str = "Invalid gamename.";
 				printf("%s\n", str);
 				return;
@@ -176,6 +209,7 @@ namespace party
 			const auto mapname = info.get("mapname");
 			if (mapname.empty())
 			{
+				connection_log::log("handle_connect_query_response: REJECTED - empty mapname");
 				const auto str = "Invalid map.";
 				printf("%s\n", str);
 				return;
@@ -184,51 +218,67 @@ namespace party
 			const auto gametype = info.get("gametype");
 			if (gametype.empty())
 			{
+				connection_log::log("handle_connect_query_response: REJECTED - empty gametype");
 				const auto str = "Invalid gametype.";
 				printf("%s\n", str);
 				return;
 			}
 
 			const auto mod_id = info.get("modId");
+			const auto workshop_id = info.get("workshop_id");
 
-			const auto workshop_id = info.get("workshop_id"); //check workshop_id dvar for id
-
-			//const auto hostname = info.get("sv_hostname");
 			const auto playmode = info.get("playmode");
 			const auto mode = static_cast<game::eModes>(std::atoi(playmode.data()));
-			//const auto xuid = strtoull(info.get("xuid").data(), nullptr, 16);
+
+			connection_log::log("handle_connect_query_response: ACCEPTED - map=%s gametype=%s playmode=%s mode=%d mod=%s workshop=%s sv_running=%s clients=%s",
+			                    mapname.data(), gametype.data(), playmode.data(), static_cast<int>(mode),
+			                    mod_id.data(), workshop_id.data(),
+			                    info.get("sv_running").data(), info.get("clients").data());
 
 			scheduler::once([=]
 			{
 				const auto usermap_id = workshop::get_usermap_publisher_id(mapname);
+
+				connection_log::log("handle_connect_query_response [main thread]: usermap_id=%s", usermap_id.data());
 
 				if (workshop::check_valid_usermap_id(mapname, usermap_id, workshop_id) &&
 					workshop::check_valid_mod_id(mod_id, workshop_id))
 				{
 					if (is_connecting_to_dedi)
 					{
+						connection_log::log("handle_connect_query_response: setting game mode to MATCHMAKING_PLAYLIST (dedicated)");
 						game::Com_SessionMode_SetGameMode(game::MODE_GAME_MATCHMAKING_PLAYLIST);
 					}
 
-					//connect_to_session(target, hostname, xuid, mode);
+					connection_log::log("handle_connect_query_response: proceeding to connect_to_lobby_with_mode");
 					connect_to_lobby_with_mode(target, mode, mapname, gametype, usermap_id, mod_id);
+				}
+				else
+				{
+					connection_log::log("handle_connect_query_response: REJECTED - workshop/mod validation failed");
 				}
 			}, scheduler::main);
 		}
 
 		void connect_stub(const char* address)
 		{
+			connection_log::log("connect_stub: address='%s'", address ? address : "(null)");
+
 			if (address)
 			{
 				const auto target = network::address_from_string(address);
 				if (target.type == game::NA_BAD)
 				{
+					connection_log::log("connect_stub: FAILED - address resolved to NA_BAD");
 					return;
 				}
 
+				connection_log::log("connect_stub: resolved to type=%d addr=%u port=%u",
+				                    static_cast<int>(target.type), target.addr, static_cast<unsigned>(target.port));
 				connect_host = target;
 			}
 
+			connection_log::log("connect_stub: clearing profile infos and querying server");
 			profile_infos::clear_profile_infos();
 			query_server(connect_host, handle_connect_query_response);
 		}
@@ -239,11 +289,18 @@ namespace party
 			query.query_time = std::chrono::high_resolution_clock::now();
 			query.challenge = utils::cryptography::random::get_challenge();
 
+			connection_log::log("send_server_query: sending getInfo to %u:%u challenge=%s",
+			                    query.host.addr, static_cast<unsigned>(query.host.port),
+			                    query.challenge.data());
+
 			network::send(query.host, "getInfo", query.challenge);
 		}
 
 		void handle_info_response(const game::netadr_t& target, const network::data_view& data)
 		{
+			connection_log::log("handle_info_response: received from %u:%u data_size=%zu",
+			                    target.addr, static_cast<unsigned>(target.port), data.size());
+
 			bool found_query = false;
 			server_query query{};
 
@@ -251,6 +308,7 @@ namespace party
 
 			get_server_queries().access([&](std::vector<server_query>& server_queries)
 			{
+				connection_log::log("handle_info_response: checking %zu pending queries", server_queries.size());
 				for (auto i = server_queries.begin(); i != server_queries.end(); ++i)
 				{
 					if (i->host == target && i->challenge == info.get("challenge"))
@@ -268,7 +326,12 @@ namespace party
 				const auto ping = std::chrono::high_resolution_clock::now() - query.query_time;
 				const auto ping_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ping).count();
 
+				connection_log::log("handle_info_response: matched query, ping=%lldms, calling callback", ping_ms);
 				query.callback(true, query.host, info, static_cast<uint32_t>(ping_ms));
+			}
+			else
+			{
+				connection_log::log("handle_info_response: NO matching query found (stale or unknown response)");
 			}
 		}
 
@@ -308,6 +371,8 @@ namespace party
 			const utils::info_string empty{};
 			for (const auto& query : removed_queries)
 			{
+				connection_log::log("cleanup_queried_servers: query TIMED OUT for %u:%u",
+				                    query.host.addr, static_cast<unsigned>(query.host.port));
 				query.callback(false, query.host, empty, 0);
 			}
 		}

@@ -4,6 +4,7 @@
 #include "game/game.hpp"
 #include "steam/steam.hpp"
 
+#include "connection_log.hpp"
 #include "network.hpp"
 #include "workshop.hpp"
 
@@ -86,6 +87,8 @@ namespace getinfo
 
 			network::on("getInfo", [](const game::netadr_t& target, const network::data_view& data)
 			{
+				connection_log::log("getInfo: request from %u:%u", target.addr, static_cast<unsigned>(target.port));
+
 				utils::info_string info{};
 				info.set("challenge", std::string{data.begin(), data.end()});
 				info.set("gamename", "T7");
@@ -116,6 +119,11 @@ namespace getinfo
 				info.set("sv_wwwBaseURL", game::get_dvar_string("sv_wwwBaseURL"));
 				info.set("workshop_id", game::get_dvar_string("workshop_id"));
 
+				connection_log::log("getInfo: responding to %u:%u map=%s gametype=%s clients=%s sv_running=%s playmode=%s",
+				                    target.addr, static_cast<unsigned>(target.port),
+				                    info.get("mapname").data(), info.get("gametype").data(),
+				                    info.get("clients").data(), info.get("sv_running").data(),
+				                    info.get("playmode").data());
 				network::send(target, "infoResponse", info.build(), '\n');
 			});
 		}

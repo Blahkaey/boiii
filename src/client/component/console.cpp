@@ -12,6 +12,7 @@
 #include <utils/image.hpp>
 
 #include <utils/io.hpp>
+#include <utils/string.hpp>
 
 #include <Richedit.h>
 
@@ -31,6 +32,58 @@ namespace console
 		std::atomic_bool terminate_runner{false};
 		utils::concurrency::container<std::function<void(const std::string& message)>> interceptor{};
 		utils::concurrency::container<std::queue<std::string>> message_queue{};
+
+		std::mutex console_log_mutex;
+		std::string console_log_path;
+
+		std::string get_console_log_path()
+		{
+			if (console_log_path.empty())
+			{
+				char path[MAX_PATH]{};
+				GetModuleFileNameA(nullptr, path, sizeof(path));
+
+				std::string dir(path);
+				const auto pos = dir.find_last_of("\\/");
+				if (pos != std::string::npos)
+				{
+					dir = dir.substr(0, pos + 1);
+				}
+
+				console_log_path = dir + "console.log";
+			}
+
+			return console_log_path;
+		}
+
+		std::string strip_color_codes(const std::string& text)
+		{
+			std::string result;
+			result.reserve(text.size());
+
+			for (size_t i = 0; i < text.size(); ++i)
+			{
+				if (text[i] == '^' && (i + 1) < text.size())
+				{
+					const char code = text[i + 1];
+					if ((code >= '0' && code <= '9') || code == ':')
+					{
+						++i;
+						continue;
+					}
+				}
+
+				result.push_back(text[i]);
+			}
+
+			return result;
+		}
+
+		void write_console_log(const char* message)
+		{
+			std::lock_guard lock(console_log_mutex);
+			utils::io::write_file(get_console_log_path(), strip_color_codes(message), true);
+		}
 		std::vector<std::string> dvar_name_list{};
 		std::atomic_bool dvar_list_loaded{false};
 
@@ -518,6 +571,8 @@ namespace console
 
 		void queue_message(const char* message)
 		{
+			write_console_log(message);
+
 			interceptor.access([message](const std::function<void(const std::string&)>& callback)
 			{
 				if (callback)

@@ -4,6 +4,7 @@
 #include "game/fragment_handler.hpp"
 
 #include "command.hpp"
+#include "connection_log.hpp"
 #include "network.hpp"
 #include "party.hpp"
 #include "scheduler.hpp"
@@ -32,10 +33,20 @@ namespace network
 			const auto offset = cmd_string.size() + 5;
 			if (message->cursize < 0 || static_cast<size_t>(message->cursize) < offset || handler == callbacks.end())
 			{
+				if (cmd_string == "connect" || cmd_string == "inforesponse" || cmd_string == "getinfo" ||
+				    cmd_string == "error" || cmd_string == "print")
+				{
+					connection_log::log("network::handle_command: UNHANDLED cmd='%s' from %u:%u size=%d",
+					                    cmd_string.data(), address->addr, static_cast<unsigned>(address->port),
+					                    message->cursize);
+				}
 				return TRUE;
 			}
 
 			const std::basic_string_view data(message->data + offset, message->cursize - offset);
+
+			connection_log::log("network::handle_command: cmd='%s' from %u:%u data_size=%zu",
+			                    cmd_string.data(), address->addr, static_cast<unsigned>(address->port), data.size());
 
 			try
 			{
@@ -43,10 +54,12 @@ namespace network
 			}
 			catch (const std::exception& e)
 			{
+				connection_log::log("network::handle_command: EXCEPTION in '%s' handler: %s", cmd_string.data(), e.what());
 				printf("Error: %s\n", e.what());
 			}
 			catch (...)
 			{
+				connection_log::log("network::handle_command: UNKNOWN EXCEPTION in '%s' handler", cmd_string.data());
 			}
 
 			return FALSE;
@@ -160,13 +173,21 @@ namespace network
 		{
 			if (from_adr.type != game::NA_LOOPBACK)
 			{
+				// Rate-limit this log to avoid spam - log first 5 then every 100th
+				static std::atomic<uint64_t> blocked_count{0};
+				const auto count = ++blocked_count;
+				if (count <= 5 || count % 100 == 0)
+				{
+					connection_log::log("handle_packet_internal: BLOCKED non-loopback packet type=%d from %u:%u lobby=%d (total_blocked=%llu)",
+					                    static_cast<int>(from_adr.type), from_adr.addr,
+					                    static_cast<unsigned>(from_adr.port), static_cast<int>(lobby_type), count);
+				}
 				return 0;
 			}
 
-			return handle_packet_internal_hook.invoke<bool>(controller_index, from_adr, from_xuid, lobby_type,
-			                                                dest_module, msg)
-				       ? 1
-				       : 0;
+			const auto result = handle_packet_internal_hook.invoke<bool>(controller_index, from_adr, from_xuid, lobby_type,
+			                                                dest_module, msg);
+			return result ? 1 : 0;
 		}
 
 		uint64_t ret2()
