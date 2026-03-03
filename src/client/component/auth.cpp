@@ -68,15 +68,8 @@ std::string get_protected_data() {
 
 std::string get_key_entropy() {
   std::string entropy{};
-  entropy.append(utils::smbios::get_uuid());
-  entropy.append(get_hw_profile_guid());
-  entropy.append(get_protected_data());
-  entropy.append(get_hdd_serial());
-
-  if (entropy.empty()) {
-    entropy.resize(32);
-    utils::cryptography::random::get_data(entropy.data(), entropy.size());
-  }
+  entropy.resize(32);
+  utils::cryptography::random::get_data(entropy.data(), entropy.size());
 
   return entropy;
 }
