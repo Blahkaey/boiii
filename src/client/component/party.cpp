@@ -24,6 +24,10 @@ namespace party
 		std::atomic_bool is_connecting_to_dedi{false};
 		game::netadr_t connect_host{{}, {}, game::NA_BAD, {}};
 
+		constexpr int MAX_WAIT_FOR_SERVER_RETRIES = 30;
+		constexpr auto WAIT_FOR_SERVER_RETRY_DELAY = 2s;
+		std::atomic_int wait_for_server_retries{0};
+
 		struct server_query
 		{
 			bool sent{false};
@@ -224,6 +228,33 @@ namespace party
 				return;
 			}
 
+			const auto sv_running = info.get("sv_running");
+			const auto host_not_ready = sv_running != "1" || mapname == "core_frontend";
+			if (host_not_ready)
+			{
+				const auto retry = wait_for_server_retries.fetch_add(1);
+				if (retry < MAX_WAIT_FOR_SERVER_RETRIES)
+				{
+					connection_log::log("handle_connect_query_response: host not ready (sv_running=%s, map=%s), retry %d/%d in 2s",
+					                    sv_running.data(), mapname.data(), retry + 1, MAX_WAIT_FOR_SERVER_RETRIES);
+					printf("Waiting for host to load the map... (%d/%d)\n", retry + 1, MAX_WAIT_FOR_SERVER_RETRIES);
+
+					scheduler::once([=]
+					{
+						query_server(connect_host, handle_connect_query_response);
+					}, scheduler::async, WAIT_FOR_SERVER_RETRY_DELAY);
+					return;
+				}
+
+				connection_log::log("handle_connect_query_response: REJECTED - host not ready after %d retries (sv_running=%s, map=%s)",
+				                    MAX_WAIT_FOR_SERVER_RETRIES, sv_running.data(), mapname.data());
+				printf("Host did not load the map in time.\n");
+				wait_for_server_retries = 0;
+				return;
+			}
+
+			wait_for_server_retries = 0;
+
 			const auto mod_id = info.get("modId");
 			const auto workshop_id = info.get("workshop_id");
 
@@ -233,7 +264,7 @@ namespace party
 			connection_log::log("handle_connect_query_response: ACCEPTED - map=%s gametype=%s playmode=%s mode=%d mod=%s workshop=%s sv_running=%s clients=%s",
 			                    mapname.data(), gametype.data(), playmode.data(), static_cast<int>(mode),
 			                    mod_id.data(), workshop_id.data(),
-			                    info.get("sv_running").data(), info.get("clients").data());
+			                    sv_running.data(), info.get("clients").data());
 
 			scheduler::once([=]
 			{
