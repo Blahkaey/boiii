@@ -63,6 +63,14 @@ CoD.LobbyButtons.SETTING_UP_BOTS = {
   customId = "btnSettingUpBots",
 }
 
+CoD.LobbyButtons.CONNECT_LAN = {
+  stringRef = "JOIN LOCAL PARTY",
+  action = function(self, element, controller, param, menu)
+    Engine.Exec(nil, "connect 127.0.0.1")
+  end,
+  customId = "btnConnectLAN",
+}
+
 CoD.LobbyButtons.GameSettingsFlyoutArenas = {
   stringRef = "MPUI_SETUP_GAME_CAPS",
   action = function(self, element, controller, param, menu)
@@ -136,6 +144,7 @@ local addCustomButtons = function(controller, menuId, buttonTable, isLeader)
 
     utils.AddLargeButton(controller, buttonTable, CoD.LobbyButtons.MP_START_GAME, 1)
     utils.AddSmallButton(controller, buttonTable, CoD.LobbyButtons.GameSettingsFlyoutMP, 2)
+    utils.AddSmallButton(controller, buttonTable, CoD.LobbyButtons.CONNECT_LAN, 3)
     utils.AddSpacer(buttonTable, utils.GetButtonIndex(buttonTable, CoD.LobbyButtons.GameSettingsFlyoutMP))
 
     lobbyMapVote(shouldShowMapVote)
@@ -150,6 +159,8 @@ local addCustomButtons = function(controller, menuId, buttonTable, isLeader)
   if menuId == LobbyData.UITargets.UI_ZMLOBBYONLINE.id then
     utils.RemoveButton(buttonTable, CoD.LobbyButtons.THEATER_ZM)
     utils.AddLargeButton(controller, buttonTable, CoD.LobbyButtons.THEATER_ZM)
+
+    utils.AddSmallButton(controller, buttonTable, CoD.LobbyButtons.CONNECT_LAN, 4)
 
     utils.RemoveSpaces(buttonTable)
     utils.AddSpacer(buttonTable, utils.GetButtonIndex(buttonTable, CoD.LobbyButtons.SERVER_BROWSER))
