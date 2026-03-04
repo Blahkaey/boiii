@@ -17,6 +17,7 @@ namespace network
 {
 	namespace
 	{
+		std::atomic<uint16_t> bound_port{0};
 		utils::hook::detour handle_packet_internal_hook{};
 
 		std::unordered_map<std::string, callback>& get_callbacks()
@@ -130,6 +131,8 @@ namespace network
 				if (++retries > 10) return;
 			}
 			while (bind(s, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == SOCKET_ERROR);
+
+			bound_port = port - 1; // port was post-incremented after successful bind
 		}
 
 		bool& socket_byte_missing()
@@ -277,6 +280,11 @@ namespace network
 		addr.addr = ip;
 
 		return addr;
+	}
+
+	uint16_t get_bound_port()
+	{
+		return bound_port;
 	}
 
 	bool are_addresses_equal(const game::netadr_t& a, const game::netadr_t& b)

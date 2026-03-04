@@ -17,6 +17,8 @@ namespace network
 	game::netadr_t address_from_string(const std::string& address);
 	game::netadr_t address_from_ip(uint32_t ip, uint16_t port);
 
+	uint16_t get_bound_port();
+
 	bool are_addresses_equal(const game::netadr_t& a, const game::netadr_t& b);
 }
 

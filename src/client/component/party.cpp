@@ -17,6 +17,8 @@
 #include <utils/cryptography.hpp>
 #include <utils/concurrency.hpp>
 
+#include <mutex>
+
 namespace party
 {
 	namespace
@@ -291,6 +293,185 @@ namespace party
 			}, scheduler::main);
 		}
 
+		void scan_for_local_instance(); // forward declaration
+
+		constexpr uint16_t SCAN_PORT_MIN = 27017;
+		constexpr uint16_t SCAN_PORT_MAX = 27027;
+
+		struct scan_candidate
+		{
+			game::netadr_t addr{};
+			int clients{0};
+			uint32_t ping{0};
+			utils::info_string info{};
+		};
+
+		struct localhost_scan_state
+		{
+			std::mutex mutex{};
+			uint64_t our_xuid{0};
+			int pending_queries{0};
+			bool connection_initiated{false};
+			std::vector<scan_candidate> candidates{};
+		};
+
+		std::shared_ptr<localhost_scan_state> active_scan{};
+
+		// Must be called WITHOUT holding scan->mutex
+		void evaluate_scan_results(const std::shared_ptr<localhost_scan_state>& scan)
+		{
+			std::lock_guard lock(scan->mutex);
+
+			if (scan->connection_initiated)
+			{
+				return;
+			}
+
+			connection_log::log("localhost_scan: evaluating %zu candidates", scan->candidates.size());
+
+			// Pick the candidate with the most clients (the active host)
+			scan_candidate* best = nullptr;
+			for (auto& c : scan->candidates)
+			{
+				if (!best || c.clients > best->clients)
+				{
+					best = &c;
+				}
+			}
+
+			if (best)
+			{
+				scan->connection_initiated = true;
+				connection_log::log("localhost_scan: selected host at port %u with %d clients",
+				                    static_cast<unsigned>(best->addr.port), best->clients);
+
+				connect_host = best->addr;
+				const auto info_copy = best->info;
+				const auto addr_copy = best->addr;
+				const auto ping_copy = best->ping;
+
+				handle_connect_query_response(true, addr_copy, info_copy, ping_copy);
+			}
+			else if (scan->pending_queries <= 0)
+			{
+				const auto retry = wait_for_server_retries.fetch_add(1);
+				if (retry < MAX_WAIT_FOR_SERVER_RETRIES)
+				{
+					connection_log::log("localhost_scan: no valid host found, retry %d/%d in 2s",
+					                    retry + 1, MAX_WAIT_FOR_SERVER_RETRIES);
+					printf("Scanning for local instance... (%d/%d)\n", retry + 1, MAX_WAIT_FOR_SERVER_RETRIES);
+
+					scan->connection_initiated = true;
+					scheduler::once([]
+					{
+						scan_for_local_instance();
+					}, scheduler::async, WAIT_FOR_SERVER_RETRY_DELAY);
+				}
+				else
+				{
+					connection_log::log("localhost_scan: no local instance found after %d retries", MAX_WAIT_FOR_SERVER_RETRIES);
+					printf("No other local instance found.\n");
+					wait_for_server_retries = 0;
+				}
+			}
+		}
+
+		void scan_for_local_instance()
+		{
+			auto scan = std::make_shared<localhost_scan_state>();
+			scan->our_xuid = auth::get_guid();
+			scan->pending_queries = (SCAN_PORT_MAX - SCAN_PORT_MIN + 1);
+
+			const auto localhost_ip = htonl(INADDR_LOOPBACK); // 127.0.0.1
+
+			connection_log::log("localhost_scan: scanning ports %u-%u, our_xuid=%llX, our_port=%u",
+			                    SCAN_PORT_MIN, SCAN_PORT_MAX, scan->our_xuid,
+			                    static_cast<unsigned>(network::get_bound_port()));
+
+			active_scan = scan;
+
+			for (uint16_t port = SCAN_PORT_MIN; port <= SCAN_PORT_MAX; ++port)
+			{
+				const auto target = network::address_from_ip(localhost_ip, port);
+
+				query_server(target, [scan, port](const bool success, const game::netadr_t& host,
+				                                   const utils::info_string& info, const uint32_t ping)
+				{
+					bool should_evaluate = false;
+
+					{
+						std::lock_guard lock(scan->mutex);
+						scan->pending_queries--;
+
+						if (scan->connection_initiated)
+						{
+							return;
+						}
+
+						if (!success)
+						{
+							connection_log::log("localhost_scan: port %u - no response", static_cast<unsigned>(port));
+							should_evaluate = (scan->pending_queries <= 0);
+						}
+						else
+						{
+							const auto xuid_str = info.get("xuid");
+							const auto remote_xuid = strtoull(xuid_str.data(), nullptr, 16);
+
+							if (remote_xuid == scan->our_xuid)
+							{
+								connection_log::log("localhost_scan: port %u - skipping self (xuid=%llX)",
+								                    static_cast<unsigned>(port), remote_xuid);
+								should_evaluate = (scan->pending_queries <= 0);
+							}
+							else
+							{
+								const auto sv_running = info.get("sv_running");
+								const auto mapname = info.get("mapname");
+
+								if (sv_running != "1" || mapname == "core_frontend")
+								{
+									connection_log::log("localhost_scan: port %u - not ready (sv_running=%s, map=%s)",
+									                    static_cast<unsigned>(port), sv_running.data(), mapname.data());
+									should_evaluate = (scan->pending_queries <= 0);
+								}
+								else
+								{
+									const auto clients = atoi(info.get("clients").data());
+									connection_log::log("localhost_scan: port %u - valid host (xuid=%llX, clients=%d, map=%s)",
+									                    static_cast<unsigned>(port), remote_xuid, clients, mapname.data());
+
+									scan->candidates.push_back({host, clients, ping, info});
+									should_evaluate = (scan->pending_queries <= 0);
+								}
+							}
+						}
+					}
+
+					if (should_evaluate)
+					{
+						evaluate_scan_results(scan);
+					}
+				});
+			}
+		}
+
+		bool is_bare_localhost(const char* address_str, const game::netadr_t& resolved)
+		{
+			// Check if this is 127.0.0.1 without an explicit port
+			if (!address_str) return false;
+
+			const std::string addr(address_str);
+			if (addr.find(':') != std::string::npos)
+			{
+				return false; // Has explicit port
+			}
+
+			// Check if it resolves to localhost with default port
+			const auto localhost_ip = htonl(INADDR_LOOPBACK);
+			return resolved.addr == localhost_ip && resolved.port == 27017;
+		}
+
 		void connect_stub(const char* address)
 		{
 			connection_log::log("connect_stub: address='%s'", address ? address : "(null)");
@@ -306,6 +487,16 @@ namespace party
 
 				connection_log::log("connect_stub: resolved to type=%d addr=%u port=%u",
 				                    static_cast<int>(target.type), target.addr, static_cast<unsigned>(target.port));
+
+				if (is_bare_localhost(address, target))
+				{
+					connection_log::log("connect_stub: bare localhost detected, starting local scan");
+					profile_infos::clear_profile_infos();
+					wait_for_server_retries = 0;
+					scan_for_local_instance();
+					return;
+				}
+
 				connect_host = target;
 			}
 
