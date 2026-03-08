@@ -50,7 +50,17 @@ namespace console
 					dir = dir.substr(0, pos + 1);
 				}
 
-				console_log_path = dir + "console.log";
+				const auto now = std::chrono::system_clock::now();
+				const auto time = std::chrono::system_clock::to_time_t(now);
+				struct tm t{};
+				localtime_s(&t, &time);
+
+				char date_buf[64]{};
+				snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02d_%02d-%02d-%02d",
+				         t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+				         t.tm_hour, t.tm_min, t.tm_sec);
+
+				console_log_path = dir + "console_" + date_buf + ".log";
 			}
 
 			return console_log_path;
@@ -869,17 +879,17 @@ namespace console
 				utils::hook::set<uint8_t>(0x14133D2FE_g, 0xEB); // Always enable ingame console
 				utils::hook::jump(0x141344E44_g, 0x141344E2E_g);
 				// Remove the need to type '\' or '/' to send a console command
-
-				if (utils::nt::is_wine() && !utils::flags::has_flag("console"))
-				{
-					return;
-				}
 			}
 
+			// Always hook printf and queue_message so console log file is written
 			utils::hook::jump(printf, print_stub);
-
 			utils::hook::jump(game::select(0x142332C30, 0x1405976B0), queue_message);
 			utils::hook::nop(game::select(0x142332C4A, 0x1405976CA), 2); // Print from every thread
+
+			if (!game::is_server() && utils::nt::is_wine() && !utils::flags::has_flag("console"))
+			{
+				return;
+			}
 
 			//const auto self = utils::nt::library::get_by_address(sys_create_console_stub);
 			//logo = LoadImageA(self.get_handle(), MAKEINTRESOURCEA(IMAGE_LOGO), 0, 0, 0, LR_COPYFROMRESOURCE);
