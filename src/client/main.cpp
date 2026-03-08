@@ -101,6 +101,10 @@ namespace
 		game_path.replace_extension(".start");
 
 		utils::io::remove_file(game_path);
+
+		// Also remove the game's own crash marker files to suppress the safe mode prompt
+		utils::io::remove_file("BlackOps3.start");
+		utils::io::remove_file("BlackOps3_UnrankedDedicatedServer.start");
 	}
 
 	PIMAGE_TLS_CALLBACK* get_tls_callbacks()
@@ -571,7 +575,7 @@ int main()
 				trigger_high_performance_gpu_switch();
 
 				const auto launch = utils::flags::has_flag("launch");
-				if (!launch && !utils::nt::is_wine() && !launcher::run())
+				if (!launch && !launcher::run())
 				{
 					return 0;
 				}
