@@ -1,15 +1,17 @@
 #include <std_include.hpp>
 #include "loader/component_loader.hpp"
 #include "game/game.hpp"
+#include "game/utils.hpp"
 
 #include "party.hpp"
 #include "auth.hpp"
 #include "network.hpp"
+#include "network_password.hpp"
 #include "scheduler.hpp"
 #include "workshop.hpp"
 #include "profile_infos.hpp"
-
-#include "connection_log.hpp"
+#include "friends.hpp"
+#include "steam_proxy.hpp"
 
 #include <utils/hook.hpp>
 #include <utils/string.hpp>
@@ -30,6 +32,15 @@ namespace party
 		constexpr auto WAIT_FOR_SERVER_RETRY_DELAY = 2s;
 		std::atomic_int wait_for_server_retries{0};
 
+		std::mutex hostname_mutex;
+		std::string cached_server_hostname;
+		int cached_server_max_clients = 0;
+
+		void update_dedi_dvar(bool on_dedi)
+		{
+			game::Dvar_SetFromStringByName("cl_connected_to_dedi", on_dedi ? "1" : "0", true);
+		}
+
 		struct server_query
 		{
 			bool sent{false};
@@ -48,18 +59,42 @@ namespace party
 		void connect_to_lobby(const game::netadr_t& addr, const std::string& mapname, const std::string& gamemode,
 		                      const std::string& usermap_id, const std::string& mod_id)
 		{
-			connection_log::log("connect_to_lobby: map=%s gametype=%s usermap=%s mod=%s addr=%u:%u",
-			                    mapname.data(), gamemode.data(), usermap_id.data(), mod_id.data(),
-			                    addr.addr, static_cast<unsigned>(addr.port));
-
+			game::CG_LUIHUDRestart(0);
 			auth::clear_stored_guids();
+
+			const auto current_mod = std::string(game::getPublisherIdFromLoadedMod());
+			bool will_restart = false;
+			if (current_mod != mod_id)
+			{
+				if (!usermap_id.empty() || mod_id != "usermaps")
+					will_restart = true;
+				else if (game::isModLoaded())
+					will_restart = true;
+			}
+
+			if (will_restart)
+			{
+				const auto addr_str = utils::string::va("%i.%i.%i.%i:%hu",
+					addr.ipv4.a, addr.ipv4.b, addr.ipv4.c, addr.ipv4.d, addr.port);
+				const std::string addr_copy(addr_str);
+
+				printf("[ Party ] Mod switch needed (%s -> %s), will reconnect to %s after restart\n",
+					current_mod.c_str(), mod_id.c_str(), addr_copy.c_str());
+
+				scheduler::once([addr_copy]
+				{
+					printf("[ Party ] Reconnecting to %s after mod switch\n", addr_copy.c_str());
+					game::Cbuf_AddText(0, utils::string::va("connect %s\n", addr_copy.c_str()));
+				}, scheduler::main, 5s);
+
+				workshop::setup_same_mod_as_host(usermap_id, mod_id);
+				return;
+			}
 
 			workshop::setup_same_mod_as_host(usermap_id, mod_id);
 
 			game::XSESSION_INFO info{};
-			connection_log::log("connect_to_lobby: calling CL_ConnectFromLobby");
 			game::CL_ConnectFromLobby(0, &info, &addr, 1, 0, mapname.data(), gamemode.data(), usermap_id.data());
-			connection_log::log("connect_to_lobby: CL_ConnectFromLobby returned");
 		}
 
 		void launch_mode(const game::eModes mode)
@@ -72,34 +107,25 @@ namespace party
 			}, scheduler::main);
 		}
 
-		void connect_to_lobby_with_mode(const game::netadr_t& addr, const game::eModes mode, const std::string& mapname,
+		void connect_to_lobby_with_mode_internal(const game::netadr_t& addr, const game::eModes mode, const std::string& mapname,
 		                                const std::string& gametype, const std::string& usermap_id,
 		                                const std::string& mod_id,
 		                                const bool was_retried = false)
 		{
-			connection_log::log("connect_to_lobby_with_mode: mode=%d mapname=%s gametype=%s was_retried=%d",
-			                    static_cast<int>(mode), mapname.data(), gametype.data(), was_retried);
-
 			if (game::Com_SessionMode_IsMode(mode))
 			{
-				connection_log::log("connect_to_lobby_with_mode: already in correct mode, connecting directly");
 				connect_to_lobby(addr, mapname, gametype, usermap_id, mod_id);
 				return;
 			}
 
 			if (!was_retried)
 			{
-				connection_log::log("connect_to_lobby_with_mode: wrong mode, launching mode %d and retrying in 5s", static_cast<int>(mode));
 				scheduler::once([=]
 				{
-					connect_to_lobby_with_mode(addr, mode, mapname, gametype, usermap_id, mod_id, true);
+					connect_to_lobby_with_mode_internal(addr, mode, mapname, gametype, usermap_id, mod_id, true);
 				}, scheduler::main, 5s);
 
 				launch_mode(mode);
-			}
-			else
-			{
-				connection_log::log("connect_to_lobby_with_mode: FAILED - was_retried=true but still wrong mode");
 			}
 		}
 
@@ -121,20 +147,14 @@ namespace party
 		void connect_to_session(const game::netadr_t& addr, const std::string& hostname, const uint64_t xuid,
 		                        const game::eModes mode)
 		{
-			connection_log::log("connect_to_session: host=%s xuid=%llX mode=%d addr=%u:%u",
-			                    hostname.data(), xuid, static_cast<int>(mode),
-			                    addr.addr, static_cast<unsigned>(addr.port));
-
 			const auto LobbyJoin_Begin = reinterpret_cast<bool(*)(int actionId, game::ControllerIndex_t controllerIndex,
 			                                                      game::LobbyType sourceLobbyType,
 			                                                      game::LobbyType targetLobbyType)>(0x141ED94D0_g);
 
 			if (!LobbyJoin_Begin(0, game::CONTROLLER_INDEX_FIRST, game::LOBBY_TYPE_PRIVATE, game::LOBBY_TYPE_PRIVATE))
 			{
-				connection_log::log("connect_to_session: LobbyJoin_Begin FAILED");
 				return;
 			}
-			connection_log::log("connect_to_session: LobbyJoin_Begin succeeded");
 
 			auto& join = *game::s_join;
 
@@ -172,22 +192,23 @@ namespace party
 		void handle_connect_query_response(const bool success, const game::netadr_t& target,
 		                                   const utils::info_string& info, uint32_t ping)
 		{
-			connection_log::log("handle_connect_query_response: success=%d ping=%ums addr=%u:%u",
-			                    success, ping, target.addr, static_cast<unsigned>(target.port));
-
 			if (!success)
 			{
-				connection_log::log("handle_connect_query_response: query FAILED (timeout or no response)");
 				return;
 			}
 
 			is_connecting_to_dedi = info.get("dedicated") == "1";
-			connection_log::log("handle_connect_query_response: dedicated=%s", info.get("dedicated").data());
+			update_dedi_dvar(is_connecting_to_dedi.load());
+
+			{
+				std::lock_guard lock(hostname_mutex);
+				cached_server_hostname = info.get("hostname");
+				const auto max_clients_str = info.get("sv_maxclients");
+				cached_server_max_clients = max_clients_str.empty() ? 0 : atoi(max_clients_str.data());
+			}
 
 			if (atoi(info.get("protocol").data()) != PROTOCOL)
 			{
-				connection_log::log("handle_connect_query_response: REJECTED - invalid protocol %s (expected %d)",
-				                    info.get("protocol").data(), PROTOCOL);
 				const auto str = "Invalid protocol.";
 				printf("%s\n", str);
 				return;
@@ -196,8 +217,6 @@ namespace party
 			const auto sub_protocol = atoi(info.get("sub_protocol").data());
 			if (sub_protocol != SUB_PROTOCOL && sub_protocol != (SUB_PROTOCOL - 1))
 			{
-				connection_log::log("handle_connect_query_response: REJECTED - invalid sub_protocol %d (expected %d)",
-				                    sub_protocol, SUB_PROTOCOL);
 				const auto str = "Invalid sub-protocol.";
 				printf("%s\n", str);
 				return;
@@ -206,16 +225,36 @@ namespace party
 			const auto gamename = info.get("gamename");
 			if (gamename != "T7"s)
 			{
-				connection_log::log("handle_connect_query_response: REJECTED - invalid gamename '%s'", gamename.data());
 				const auto str = "Invalid gamename.";
 				printf("%s\n", str);
 				return;
 			}
 
+			// Verify network password
+			const auto server_net_hash = info.get("net_password_hash");
+			if (!server_net_hash.empty() && server_net_hash != "0")
+			{
+				if (!network_password::is_password_set())
+				{
+					printf("Server requires a network password.\n");
+					return;
+				}
+
+				const auto client_hash = network_password::get_password_hash_string();
+				if (client_hash != server_net_hash)
+				{
+					printf("Network password mismatch.\n");
+					return;
+				}
+			}
+			else if (network_password::is_password_set())
+			{
+				printf("Client has network password set but server does not. Allowing connection.\n");
+			}
+
 			const auto mapname = info.get("mapname");
 			if (mapname.empty())
 			{
-				connection_log::log("handle_connect_query_response: REJECTED - empty mapname");
 				const auto str = "Invalid map.";
 				printf("%s\n", str);
 				return;
@@ -224,7 +263,6 @@ namespace party
 			const auto gametype = info.get("gametype");
 			if (gametype.empty())
 			{
-				connection_log::log("handle_connect_query_response: REJECTED - empty gametype");
 				const auto str = "Invalid gametype.";
 				printf("%s\n", str);
 				return;
@@ -237,8 +275,6 @@ namespace party
 				const auto retry = wait_for_server_retries.fetch_add(1);
 				if (retry < MAX_WAIT_FOR_SERVER_RETRIES)
 				{
-					connection_log::log("handle_connect_query_response: host not ready (sv_running=%s, map=%s), retry %d/%d in 2s",
-					                    sv_running.data(), mapname.data(), retry + 1, MAX_WAIT_FOR_SERVER_RETRIES);
 					printf("Waiting for host to load the map... (%d/%d)\n", retry + 1, MAX_WAIT_FOR_SERVER_RETRIES);
 
 					scheduler::once([=]
@@ -248,8 +284,6 @@ namespace party
 					return;
 				}
 
-				connection_log::log("handle_connect_query_response: REJECTED - host not ready after %d retries (sv_running=%s, map=%s)",
-				                    MAX_WAIT_FOR_SERVER_RETRIES, sv_running.data(), mapname.data());
 				printf("Host did not load the map in time.\n");
 				wait_for_server_retries = 0;
 				return;
@@ -259,36 +293,26 @@ namespace party
 
 			const auto mod_id = info.get("modId");
 			const auto workshop_id = info.get("workshop_id");
+			const auto base_url = info.get("sv_wwwBaseURL"); // FastDL base URL from server
 
 			const auto playmode = info.get("playmode");
 			const auto mode = static_cast<game::eModes>(std::atoi(playmode.data()));
-
-			connection_log::log("handle_connect_query_response: ACCEPTED - map=%s gametype=%s playmode=%s mode=%d mod=%s workshop=%s sv_running=%s clients=%s",
-			                    mapname.data(), gametype.data(), playmode.data(), static_cast<int>(mode),
-			                    mod_id.data(), workshop_id.data(),
-			                    sv_running.data(), info.get("clients").data());
 
 			scheduler::once([=]
 			{
 				const auto usermap_id = workshop::get_usermap_publisher_id(mapname);
 
-				connection_log::log("handle_connect_query_response [main thread]: usermap_id=%s", usermap_id.data());
-
-				if (workshop::check_valid_usermap_id(mapname, usermap_id, workshop_id) &&
+				if (workshop::check_valid_usermap_id(mapname, usermap_id, workshop_id, base_url) &&
 					workshop::check_valid_mod_id(mod_id, workshop_id))
 				{
-					if (is_connecting_to_dedi)
-					{
-						connection_log::log("handle_connect_query_response: setting game mode to MATCHMAKING_PLAYLIST (dedicated)");
-						game::Com_SessionMode_SetGameMode(game::MODE_GAME_MATCHMAKING_PLAYLIST);
-					}
+					game::Com_SessionMode_SetGameMode(game::MODE_GAME_MATCHMAKING_PLAYLIST);
 
-					connection_log::log("handle_connect_query_response: proceeding to connect_to_lobby_with_mode");
-					connect_to_lobby_with_mode(target, mode, mapname, gametype, usermap_id, mod_id);
+					connect_to_lobby_with_mode_internal(target, mode, mapname, gametype, usermap_id, mod_id);
 				}
-				else
+				else if (!workshop::is_any_download_active())
 				{
-					connection_log::log("handle_connect_query_response: REJECTED - workshop/mod validation failed");
+					workshop::set_pending_reconnect(utils::string::va(
+						"%i.%i.%i.%i:%hu", target.ipv4.a, target.ipv4.b, target.ipv4.c, target.ipv4.d, target.port));
 				}
 			}, scheduler::main);
 		}
@@ -327,8 +351,6 @@ namespace party
 				return;
 			}
 
-			connection_log::log("localhost_scan: evaluating %zu candidates", scan->candidates.size());
-
 			// Pick the candidate with the most clients (the active host)
 			scan_candidate* best = nullptr;
 			for (auto& c : scan->candidates)
@@ -342,8 +364,6 @@ namespace party
 			if (best)
 			{
 				scan->connection_initiated = true;
-				connection_log::log("localhost_scan: selected host at port %u with %d clients",
-				                    static_cast<unsigned>(best->addr.port), best->clients);
 
 				connect_host = best->addr;
 				const auto info_copy = best->info;
@@ -357,8 +377,6 @@ namespace party
 				const auto retry = wait_for_server_retries.fetch_add(1);
 				if (retry < MAX_WAIT_FOR_SERVER_RETRIES)
 				{
-					connection_log::log("localhost_scan: no valid host found, retry %d/%d in 2s",
-					                    retry + 1, MAX_WAIT_FOR_SERVER_RETRIES);
 					printf("Scanning for local instance... (%d/%d)\n", retry + 1, MAX_WAIT_FOR_SERVER_RETRIES);
 
 					scan->connection_initiated = true;
@@ -369,7 +387,6 @@ namespace party
 				}
 				else
 				{
-					connection_log::log("localhost_scan: no local instance found after %d retries", MAX_WAIT_FOR_SERVER_RETRIES);
 					printf("No other local instance found.\n");
 					wait_for_server_retries = 0;
 				}
@@ -383,10 +400,6 @@ namespace party
 			scan->pending_queries = (SCAN_PORT_MAX - SCAN_PORT_MIN + 1);
 
 			const auto localhost_ip = htonl(INADDR_LOOPBACK); // 127.0.0.1
-
-			connection_log::log("localhost_scan: scanning ports %u-%u, our_xuid=%llX, our_port=%u",
-			                    SCAN_PORT_MIN, SCAN_PORT_MAX, scan->our_xuid,
-			                    static_cast<unsigned>(network::get_bound_port()));
 
 			active_scan = scan;
 
@@ -410,7 +423,6 @@ namespace party
 
 						if (!success)
 						{
-							connection_log::log("localhost_scan: port %u - no response", static_cast<unsigned>(port));
 							should_evaluate = (scan->pending_queries <= 0);
 						}
 						else
@@ -420,8 +432,6 @@ namespace party
 
 							if (remote_xuid == scan->our_xuid)
 							{
-								connection_log::log("localhost_scan: port %u - skipping self (xuid=%llX)",
-								                    static_cast<unsigned>(port), remote_xuid);
 								should_evaluate = (scan->pending_queries <= 0);
 							}
 							else
@@ -431,15 +441,11 @@ namespace party
 
 								if (sv_running != "1" || mapname == "core_frontend")
 								{
-									connection_log::log("localhost_scan: port %u - not ready (sv_running=%s, map=%s)",
-									                    static_cast<unsigned>(port), sv_running.data(), mapname.data());
 									should_evaluate = (scan->pending_queries <= 0);
 								}
 								else
 								{
 									const auto clients = atoi(info.get("clients").data());
-									connection_log::log("localhost_scan: port %u - valid host (xuid=%llX, clients=%d, map=%s)",
-									                    static_cast<unsigned>(port), remote_xuid, clients, mapname.data());
 
 									scan->candidates.push_back({host, clients, ping, info});
 									should_evaluate = (scan->pending_queries <= 0);
@@ -474,23 +480,16 @@ namespace party
 
 		void connect_stub(const char* address)
 		{
-			connection_log::log("connect_stub: address='%s'", address ? address : "(null)");
-
 			if (address)
 			{
 				const auto target = network::address_from_string(address);
 				if (target.type == game::NA_BAD)
 				{
-					connection_log::log("connect_stub: FAILED - address resolved to NA_BAD");
 					return;
 				}
 
-				connection_log::log("connect_stub: resolved to type=%d addr=%u port=%u",
-				                    static_cast<int>(target.type), target.addr, static_cast<unsigned>(target.port));
-
 				if (is_bare_localhost(address, target))
 				{
-					connection_log::log("connect_stub: bare localhost detected, starting local scan");
 					profile_infos::clear_profile_infos();
 					wait_for_server_retries = 0;
 					scan_for_local_instance();
@@ -500,8 +499,36 @@ namespace party
 				connect_host = target;
 			}
 
-			connection_log::log("connect_stub: clearing profile infos and querying server");
 			profile_infos::clear_profile_infos();
+
+			if (address)
+			{
+				auto game_info = friends::get_friend_game_info_by_address(address);
+				if (!game_info.empty())
+				{
+					auto parts = utils::string::split(game_info, '|');
+					if (parts.size() >= 4)
+					{
+						auto mapname = parts[1];
+						auto gametype = parts[2];
+						auto mode = static_cast<game::eModes>(std::atoi(parts[3].c_str()));
+						std::string mod_id = parts.size() >= 5 ? parts[4] : "";
+
+						if (!mapname.empty() && !gametype.empty())
+						{
+
+							scheduler::once([=]
+							{
+								auto usermap_id = workshop::get_usermap_publisher_id(mapname);
+								game::Com_SessionMode_SetGameMode(game::MODE_GAME_MATCHMAKING_PLAYLIST);
+								connect_to_lobby_with_mode_internal(connect_host, mode, mapname, gametype, usermap_id, mod_id);
+							}, scheduler::main);
+							return;
+						}
+					}
+				}
+			}
+
 			query_server(connect_host, handle_connect_query_response);
 		}
 
@@ -511,18 +538,11 @@ namespace party
 			query.query_time = std::chrono::high_resolution_clock::now();
 			query.challenge = utils::cryptography::random::get_challenge();
 
-			connection_log::log("send_server_query: sending getInfo to %u:%u challenge=%s",
-			                    query.host.addr, static_cast<unsigned>(query.host.port),
-			                    query.challenge.data());
-
 			network::send(query.host, "getInfo", query.challenge);
 		}
 
 		void handle_info_response(const game::netadr_t& target, const network::data_view& data)
 		{
-			connection_log::log("handle_info_response: received from %u:%u data_size=%zu",
-			                    target.addr, static_cast<unsigned>(target.port), data.size());
-
 			bool found_query = false;
 			server_query query{};
 
@@ -530,7 +550,6 @@ namespace party
 
 			get_server_queries().access([&](std::vector<server_query>& server_queries)
 			{
-				connection_log::log("handle_info_response: checking %zu pending queries", server_queries.size());
 				for (auto i = server_queries.begin(); i != server_queries.end(); ++i)
 				{
 					if (i->host == target && i->challenge == info.get("challenge"))
@@ -548,12 +567,7 @@ namespace party
 				const auto ping = std::chrono::high_resolution_clock::now() - query.query_time;
 				const auto ping_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ping).count();
 
-				connection_log::log("handle_info_response: matched query, ping=%lldms, calling callback", ping_ms);
 				query.callback(true, query.host, info, static_cast<uint32_t>(ping_ms));
-			}
-			else
-			{
-				connection_log::log("handle_info_response: NO matching query found (stale or unknown response)");
 			}
 		}
 
@@ -593,8 +607,6 @@ namespace party
 			const utils::info_string empty{};
 			for (const auto& query : removed_queries)
 			{
-				connection_log::log("cleanup_queried_servers: query TIMED OUT for %u:%u",
-				                    query.host.addr, static_cast<unsigned>(query.host.port));
 				query.callback(false, query.host, empty, 0);
 			}
 		}
@@ -613,6 +625,13 @@ namespace party
 		});
 	}
 
+	void connect_to_lobby_with_mode(const game::netadr_t& addr, const game::eModes mode,
+	                                const std::string& mapname, const std::string& gametype,
+	                                const std::string& usermap_id, const std::string& mod_id)
+	{
+		connect_to_lobby_with_mode_internal(addr, mode, mapname, gametype, usermap_id, mod_id, false);
+	}
+
 	game::netadr_t get_connected_server()
 	{
 		constexpr auto local_client_num = 0ull;
@@ -620,18 +639,61 @@ namespace party
 		return *reinterpret_cast<game::netadr_t*>(address);
 	}
 
+	game::netadr_t get_connect_host()
+	{
+		return connect_host;
+	}
+
 	bool is_host(const game::netadr_t& addr)
 	{
 		return get_connected_server() == addr || connect_host == addr;
+	}
+
+	void join_session(const game::netadr_t& addr, const std::string& hostname, const uint64_t xuid,
+	                  const game::eModes mode)
+	{
+		connect_to_session(addr, hostname, xuid, mode);
+	}
+
+	uint16_t get_local_port()
+	{
+		const auto* dvar = game::Dvar_FindVar("net_port");
+		if (dvar)
+		{
+			return static_cast<uint16_t>(dvar->current.value.integer);
+		}
+		return 3074; // BO3 default
+	}
+
+	std::string get_server_hostname()
+	{
+		std::lock_guard lock(hostname_mutex);
+		return cached_server_hostname;
+	}
+
+	int get_server_max_clients()
+	{
+		std::lock_guard lock(hostname_mutex);
+		return cached_server_max_clients;
+	}
+
+	void clear_server_info()
+	{
+		std::lock_guard lock(hostname_mutex);
+		cached_server_hostname.clear();
+		cached_server_max_clients = 0;
 	}
 
 	struct component final : client_component
 	{
 		void post_unpack() override
 		{
+			(void)game::register_dvar_bool("cl_connected_to_dedi", false, game::DVAR_NONE, "True when connected to a dedicated server");
+
 			utils::hook::jump(0x141EE5FE0_g, &connect_stub);
 
 			network::on("infoResponse", handle_info_response);
+
 			scheduler::loop(cleanup_queried_servers, scheduler::async, 100ms);
 		}
 

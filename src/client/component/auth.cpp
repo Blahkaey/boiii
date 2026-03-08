@@ -2,7 +2,6 @@
 #include "loader/component_loader.hpp"
 
 #include "auth.hpp"
-#include "connection_log.hpp"
 #include "party.hpp"
 #include "command.hpp"
 #include "network.hpp"
@@ -19,6 +18,8 @@
 #include <utils/byte_buffer.hpp>
 #include <utils/info_string.hpp>
 #include <utils/cryptography.hpp>
+#include <utils/io.hpp>
+#include <utils/properties.hpp>
 
 #include <game/fragment_handler.hpp>
 
@@ -54,7 +55,7 @@ namespace auth
 
 		std::string get_protected_data()
 		{
-			std::string input = "momo5502-boiii-auth";
+			std::string input = "ezz-boiii-auth";
 
 			DATA_BLOB data_in{}, data_out{};
 			data_in.pbData = reinterpret_cast<uint8_t*>(input.data());
@@ -81,9 +82,72 @@ namespace auth
 			return entropy;
 		}
 
+		bool load_key(utils::cryptography::ecc::key& key)
+		{
+			std::string data{};
+
+			auto key_path = (utils::properties::get_key_path() / "ezz-private.key").generic_string();
+			if (!utils::io::read_file(key_path, &data))
+			{
+				return false;
+			}
+
+			key.deserialize(data);
+			if (!key.is_valid())
+			{
+				printf("Loaded key is invalid!\n");
+				return false;
+			}
+
+			return true;
+		}
+
+		utils::cryptography::ecc::key generate_key()
+		{
+			auto key = utils::cryptography::ecc::generate_key(512, get_key_entropy());
+			if (!key.is_valid())
+			{
+				throw std::runtime_error("Failed to generate cryptographic key!");
+			}
+
+			auto key_path = (utils::properties::get_key_path() / "ezz-private.key").generic_string();
+			if (!utils::io::write_file(key_path, key.serialize()))
+			{
+				printf("Failed to write cryptographic key!\n");
+			}
+
+			printf("Generated cryptographic key: %llX\n", key.get_hash());
+			return key;
+		}
+
+		utils::cryptography::ecc::key load_or_generate_key()
+		{
+			utils::cryptography::ecc::key key{};
+			if (load_key(key))
+			{
+				printf("Loaded cryptographic key: %llX\n", key.get_hash());
+				return key;
+			}
+
+			return generate_key();
+		}
+
+		utils::cryptography::ecc::key get_key_internal()
+		{
+			auto key = load_or_generate_key();
+
+			auto key_path = (utils::properties::get_key_path() / "ezz-public.key").generic_string();
+			if (!utils::io::write_file(key_path, key.get_public_key()))
+			{
+				printf("Failed to write public key!\n");
+			}
+
+			return key;
+		}
+
 		utils::cryptography::ecc::key& get_key()
 		{
-			static auto key = utils::cryptography::ecc::generate_key(512, get_key_entropy());
+			static auto key = get_key_internal();
 			return key;
 		}
 
@@ -91,7 +155,7 @@ namespace auth
 		{
 			static const auto is_first = []
 			{
-				static utils::nt::handle mutex = CreateMutexA(nullptr, FALSE, "boiii_mutex");
+				static utils::nt::handle mutex = CreateMutexA(nullptr, FALSE, "ezz_mutex");
 				return mutex && GetLastError() != ERROR_ALREADY_EXISTS;
 			}();
 
@@ -116,11 +180,7 @@ namespace auth
 		void send_fragmented_connect_packet(const game::netsrc_t sock, game::netadr_t* adr, const char* data,
 		                                    const int length)
 		{
-			connection_log::log("send_fragmented_connect_packet: sock=%d addr=%u:%u data_len=%d",
-			                    static_cast<int>(sock), adr->addr, static_cast<unsigned>(adr->port), length);
-
 			const auto connect_data = serialize_connect_data(data, length);
-			int fragment_count = 0;
 			game::fragment_handler::fragment_data //
 			(connect_data.data(), connect_data.size(), [&](const utils::byte_buffer& buffer)
 			{
@@ -131,13 +191,10 @@ namespace auth
 
 				const auto& fragment_packet = packet_buffer.get_buffer();
 
-				++fragment_count;
 				game::NET_OutOfBandData(sock, adr,
 				                        fragment_packet.data(),
 				                        static_cast<int>(fragment_packet.size()));
 			});
-			connection_log::log("send_fragmented_connect_packet: sent %d fragments (total_size=%zu)",
-			                    fragment_count, connect_data.size());
 		}
 
 		int send_connect_data_stub(const game::netsrc_t sock, game::netadr_t* adr, const char* data, const int len)
@@ -147,17 +204,14 @@ namespace auth
 				const auto is_connect_sequence = len >= 7 && strncmp("connect", data, 7) == 0;
 				if (!is_connect_sequence)
 				{
-					connection_log::log("send_connect_data_stub: non-connect OOB data, len=%d", len);
 					return game::NET_OutOfBandData(sock, adr, data, len);
 				}
 
-				connection_log::log("send_connect_data_stub: intercepted connect sequence, len=%d", len);
 				send_fragmented_connect_packet(sock, adr, data, len);
 				return true;
 			}
 			catch (std::exception& e)
 			{
-				connection_log::log("send_connect_data_stub: EXCEPTION: %s", e.what());
 				printf("Error: %s\n", e.what());
 			}
 
@@ -239,10 +293,6 @@ namespace auth
 
 		void dispatch_connect_packet(const game::netadr_t& target, const std::string& data)
 		{
-			connection_log::log("dispatch_connect_packet: from %u:%u type=%d data_size=%zu",
-			                    target.addr, static_cast<unsigned>(target.port),
-			                    static_cast<int>(target.type), data.size());
-
 			utils::byte_buffer buffer(data);
 
 			utils::cryptography::ecc::key key{};
@@ -258,7 +308,6 @@ namespace auth
 			if (!utils::cryptography::ecc::verify_message(key, challenge, buffer.read_string()) && target.type !=
 				game::NA_LOOPBACK)
 			{
-				connection_log::log("dispatch_connect_packet: REJECTED - bad signature from %u:%u", target.addr, static_cast<unsigned>(target.port));
 				network::send(target, "error", "Bad signature");
 				return;
 			}
@@ -270,7 +319,6 @@ namespace auth
 
 			if (params.size() < 2)
 			{
-				connection_log::log("dispatch_connect_packet: REJECTED - insufficient params (size=%d)", params.size());
 				return;
 			}
 
@@ -280,8 +328,6 @@ namespace auth
 			const auto xuid = strtoull(info_string.get("xuid").data(), nullptr, 16);
 			if (xuid != key.get_hash())
 			{
-				connection_log::log("dispatch_connect_packet: REJECTED - bad XUID %llX vs key hash %llX",
-				                    xuid, key.get_hash());
 				network::send(target, "error", "Bad XUID");
 				return;
 			}
@@ -298,30 +344,20 @@ namespace auth
 
 			if (name.empty() || is_name_invalid())
 			{
-				connection_log::log("dispatch_connect_packet: REJECTED - bad name '%s'", name.data());
 				network::send(target, "error", "Bad name");
 				return;
 			}
 
-			connection_log::log("dispatch_connect_packet: ACCEPTED - name='%s' xuid=%llX, calling SV_DirectConnect",
-			                    name.data(), xuid);
-
 			profile_infos::add_and_distribute_profile_info(target, xuid, info);
 
 			game::SV_DirectConnect(target);
-			connection_log::log("dispatch_connect_packet: SV_DirectConnect returned, handling new player");
 			handle_new_player(target);
 		}
 
 		void handle_connect_packet_fragment(const game::netadr_t& target, const network::data_view& data)
 		{
-			connection_log::log("handle_connect_packet_fragment: from %u:%u data_size=%zu server_running=%d",
-			                    target.addr, static_cast<unsigned>(target.port), data.size(),
-			                    game::is_server_running());
-
 			if (!game::is_server_running())
 			{
-				connection_log::log("handle_connect_packet_fragment: IGNORED - server not running");
 				return;
 			}
 
@@ -330,16 +366,10 @@ namespace auth
 			std::string final_packet{};
 			if (game::fragment_handler::handle(target, buffer, final_packet))
 			{
-				connection_log::log("handle_connect_packet_fragment: all fragments received, dispatching (size=%zu)",
-				                    final_packet.size());
 				scheduler::once([t = target, p = std::move(final_packet)]
 				{
 					dispatch_connect_packet(t, p);
 				}, scheduler::server);
-			}
-			else
-			{
-				connection_log::log("handle_connect_packet_fragment: fragment buffered, waiting for more");
 			}
 		}
 
@@ -374,7 +404,7 @@ namespace auth
 		{
 			if (game::is_server() || is_second_instance())
 			{
-				return 0x110000100000000 | (utils::cryptography::random::get_integer() & ~0x80000000);
+				return 0x110000100000000 | (::utils::cryptography::random::get_integer() & ~0x80000000);
 			}
 
 			return get_key().get_hash();
