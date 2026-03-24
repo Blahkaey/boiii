@@ -20,10 +20,16 @@
 #include <utils/cryptography.hpp>
 #include <utils/concurrency.hpp>
 
+#include <mutex>
+
 namespace party {
 namespace {
 std::atomic_bool is_connecting_to_dedi{false};
 game::netadr_t connect_host{{}, {}, game::NA_BAD, {}};
+constexpr int MAX_WAIT_FOR_SERVER_RETRIES = 30;
+constexpr auto WAIT_FOR_SERVER_RETRY_DELAY = 2s;
+std::atomic_int wait_for_server_retries{0};
+std::atomic_bool host_loading_wait_toast_shown{false};
 
 std::mutex hostname_mutex;
 std::string cached_server_hostname;
@@ -53,6 +59,50 @@ void connect_to_lobby(const game::netadr_t &addr, const std::string &mapname,
                       const std::string &usermap_id,
                       const std::string &mod_id) {
   auth::clear_stored_guids();
+
+  // FAILSAFE incase setup_server_map_stub fail to unload. sometimes it bug out
+  // and wont unload mod anymore.
+  if (game::isModLoaded()) {
+
+    (void)workshop::get_pending_mod_reconnect();
+
+    game::loadMod(0, "", true);
+
+    auto start_time = std::make_shared<std::chrono::steady_clock::time_point>(
+        std::chrono::steady_clock::now());
+
+    scheduler::schedule(
+        [addr, mapname, gamemode, usermap_id, mod_id, start_time]() -> bool {
+          const auto elapsed = std::chrono::steady_clock::now() - *start_time;
+
+          if (elapsed < std::chrono::seconds(1))
+            return scheduler::cond_continue;
+
+          if (game::isModLoaded() && elapsed < std::chrono::seconds(30))
+            return scheduler::cond_continue;
+
+          if (game::isModLoaded()) {
+            printf("[ Party ] Timeout: mod still loaded after 30s, attempting "
+                   "connection anyway\n");
+          } else {
+            printf(
+                "[ Party ] Mod unloaded after %lld ms\n",
+                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                    .count());
+          }
+
+          workshop::setup_same_mod_as_host(usermap_id, mod_id);
+
+          game::XSESSION_INFO info{};
+          game::CL_ConnectFromLobby(0, &info, &addr, 1, 0, mapname.data(),
+                                    gamemode.data(), usermap_id.data());
+
+          return scheduler::cond_end;
+        },
+        scheduler::main, 200ms);
+
+    return;
+  }
 
   workshop::setup_same_mod_as_host(usermap_id, mod_id);
 
@@ -225,14 +275,41 @@ void handle_connect_query_response(const bool success,
     return;
   }
 
+  const auto sv_running = info.get("sv_running");
+  const auto host_not_ready = sv_running != "1" || mapname == "core_frontend";
+  if (host_not_ready) {
+    const auto retry = wait_for_server_retries.fetch_add(1);
+    if (retry < MAX_WAIT_FOR_SERVER_RETRIES) {
+      if (!host_loading_wait_toast_shown.exchange(true)) {
+        toast::show("Connecting", "Host is loading map, waiting...",
+                    "t7_icon_connect_overlays");
+      }
+
+      printf("Waiting for host to load the map... (%d/%d)\n", retry + 1,
+             MAX_WAIT_FOR_SERVER_RETRIES);
+
+      scheduler::once(
+          [=] { query_server(connect_host, handle_connect_query_response); },
+          scheduler::async, WAIT_FOR_SERVER_RETRY_DELAY);
+      return;
+    }
+
+    printf("Host did not load the map in time.\n");
+    toast::error("Connection Failed", "Host did not load the map in time.");
+    wait_for_server_retries = 0;
+    host_loading_wait_toast_shown = false;
+    return;
+  }
+
+  wait_for_server_retries = 0;
+  host_loading_wait_toast_shown = false;
+
   const auto mod_id = info.get("modId");
 
-  const auto workshop_id = info.get("workshop_id").empty()
-                               ? info.get("usermapId")
-                               : info.get("workshop_id");
-  const auto base_url = info.get("sv_wwwBaseURL").empty()
-                            ? info.get("sv_wwwBaseUrl")
-                            : info.get("sv_wwwBaseURL");
+  const auto workshop_id =
+      info.get("workshop_id"); // check workshop_id dvar for id
+  const auto base_url =
+      info.get("sv_wwwBaseURL"); // FastDL base URL from server
 
   // const auto hostname = info.get("sv_hostname");
   const auto playmode = info.get("playmode");
@@ -267,10 +344,151 @@ void handle_connect_query_response(const bool success,
       scheduler::main);
 }
 
+void scan_for_local_instance();
+
+constexpr uint16_t SCAN_PORT_MIN = 27017;
+constexpr uint16_t SCAN_PORT_MAX = 27027;
+
+struct scan_candidate {
+  game::netadr_t addr{};
+  int clients{0};
+  uint32_t ping{0};
+  utils::info_string info{};
+};
+
+struct localhost_scan_state {
+  std::mutex mutex{};
+  uint64_t our_xuid{0};
+  int pending_queries{0};
+  bool connection_initiated{false};
+  std::vector<scan_candidate> candidates{};
+};
+
+std::shared_ptr<localhost_scan_state> active_scan{};
+
+void evaluate_scan_results(const std::shared_ptr<localhost_scan_state> &scan) {
+  std::lock_guard lock(scan->mutex);
+
+  if (scan->connection_initiated) {
+    return;
+  }
+
+  scan_candidate *best = nullptr;
+  for (auto &candidate : scan->candidates) {
+    if (!best || candidate.clients > best->clients) {
+      best = &candidate;
+    }
+  }
+
+  if (best) {
+    scan->connection_initiated = true;
+    wait_for_server_retries = 0;
+
+    connect_host = best->addr;
+    const auto info_copy = best->info;
+    const auto addr_copy = best->addr;
+    const auto ping_copy = best->ping;
+
+    toast::show("Connecting", "Connecting to host", "t7_icon_connect_overlays");
+    handle_connect_query_response(true, addr_copy, info_copy, ping_copy);
+  } else if (scan->pending_queries <= 0) {
+    const auto retry = wait_for_server_retries.fetch_add(1);
+    if (retry < MAX_WAIT_FOR_SERVER_RETRIES) {
+      printf("Scanning for local instance... (%d/%d)\n", retry + 1,
+             MAX_WAIT_FOR_SERVER_RETRIES);
+
+      scan->connection_initiated = true;
+      scheduler::once([] { scan_for_local_instance(); }, scheduler::async,
+                      WAIT_FOR_SERVER_RETRY_DELAY);
+    } else {
+      printf("No other local instance found.\n");
+      toast::error("Connection Failed", "No other local instance found.");
+      wait_for_server_retries = 0;
+    }
+  }
+}
+
+void scan_for_local_instance() {
+  auto scan = std::make_shared<localhost_scan_state>();
+  scan->our_xuid = auth::get_guid();
+  scan->pending_queries = (SCAN_PORT_MAX - SCAN_PORT_MIN + 1);
+
+  const auto localhost_ip = htonl(INADDR_LOOPBACK);
+  active_scan = scan;
+
+  for (uint16_t port = SCAN_PORT_MIN; port <= SCAN_PORT_MAX; ++port) {
+    const auto target = network::address_from_ip(localhost_ip, port);
+    query_server(target, [scan, port](const bool success,
+                                      const game::netadr_t &host,
+                                      const utils::info_string &info,
+                                      const uint32_t ping) {
+      bool should_evaluate = false;
+
+      {
+        std::lock_guard lock(scan->mutex);
+        scan->pending_queries--;
+
+        if (scan->connection_initiated) {
+          return;
+        }
+
+        if (!success) {
+          should_evaluate = (scan->pending_queries <= 0);
+        } else {
+          const auto xuid_str = info.get("xuid");
+          const auto remote_xuid = strtoull(xuid_str.data(), nullptr, 16);
+
+          if (remote_xuid == scan->our_xuid) {
+            should_evaluate = (scan->pending_queries <= 0);
+          } else {
+            const auto sv_running = info.get("sv_running");
+            const auto mapname = info.get("mapname");
+            if (sv_running != "1" || mapname == "core_frontend") {
+              should_evaluate = (scan->pending_queries <= 0);
+            } else {
+              const auto clients = atoi(info.get("clients").data());
+              scan->candidates.push_back({host, clients, ping, info});
+              should_evaluate = (scan->pending_queries <= 0);
+            }
+          }
+        }
+      }
+
+      if (should_evaluate) {
+        evaluate_scan_results(scan);
+      }
+    });
+  }
+}
+
+bool is_bare_localhost(const char *address_str,
+                       const game::netadr_t &resolved) {
+  if (!address_str) {
+    return false;
+  }
+
+  const std::string address{address_str};
+  if (address.find(':') != std::string::npos) {
+    return false;
+  }
+
+  const auto localhost_ip = htonl(INADDR_LOOPBACK);
+  return resolved.addr == localhost_ip && resolved.port == 27017;
+}
+
 void connect_stub(const char *address) {
   if (address) {
     const auto target = network::address_from_string(address);
     if (target.type == game::NA_BAD) {
+      return;
+    }
+
+    if (is_bare_localhost(address, target)) {
+      toast::show("Connecting", "Searching for party host",
+                  "t7_icon_connect_overlays");
+      profile_infos::clear_profile_infos();
+      wait_for_server_retries = 0;
+      scan_for_local_instance();
       return;
     }
 
@@ -421,6 +639,11 @@ void join_session(const game::netadr_t &addr, const std::string &hostname,
 }
 
 uint16_t get_local_port() {
+  const auto bound_port = network::get_bound_port();
+  if (bound_port != 0) {
+    return bound_port;
+  }
+
   const auto *dvar = game::Dvar_FindVar("net_port");
   if (dvar) {
     return static_cast<uint16_t>(dvar->current.value.integer);

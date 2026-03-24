@@ -16,6 +16,7 @@
 
 namespace network {
 namespace {
+std::atomic<uint16_t> bound_port{0};
 utils::hook::detour handle_packet_internal_hook{};
 
 std::unordered_map<std::string, callback> &get_callbacks() {
@@ -110,6 +111,7 @@ void create_ip_socket() {
   } while (bind(s, reinterpret_cast<sockaddr *>(&server_addr),
                 sizeof(server_addr)) == SOCKET_ERROR);
 
+  bound_port = static_cast<uint16_t>(port - 1);
   printf("[NET] Socket bound on port %u\n", static_cast<unsigned>(port - 1));
 
   if (!game::is_server()) {
@@ -246,6 +248,8 @@ game::netadr_t address_from_ip(const uint32_t ip, const uint16_t port) {
 
   return addr;
 }
+
+uint16_t get_bound_port() { return bound_port.load(); }
 
 bool are_addresses_equal(const game::netadr_t &a, const game::netadr_t &b) {
   if (a.type != b.type) {
